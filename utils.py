@@ -7,45 +7,6 @@ from tqdm import tqdm
 import glob
 import random
 
-_LABELS = [i.split()[0] for i in open("txt_files/obj.names", "r")]
-
-
-
-def gen_frame(nframes, frames=16, stride=8):
-    """ Generate list of list acording to frames and stride
-    """
-    last_num = nframes - (nframes%stride)
-    total_batches = int(last_num /stride)
-    for i in range(total_batches-1):
-        m = i * stride
-        n = (frames) + (i * stride)
-        x = list(range(m, n))
-        yield x
-
-def read_vid(vid_loc):
-    cap = cv2.VideoCapture(vid_loc)
-    vid = []
-    while True:
-        ret, img = cap.read()
-        if not ret:
-            break
-        vid.append(cv2.resize(img, (455, 256)))
-    vid = np.array(vid, dtype=np.float32)
-    return vid
-
-def create_npy_train_dataset(txt_loc, formats=".mp4", db_name="data/train/"):
-    num_lines = sum(1 for line in open(txt_loc))
-    for k, i in tqdm(enumerate(open(txt_loc, "r"))):
-        classs = i.split()[1]
-        loc = i.split()[0]
-        vid = read_vid(loc)
-        label = _LABELS.index(classs)
-        for f, fra in enumerate(gen_frame(len(vid), 64, 32)):
-            X = np.concatenate([vid[m][np.newaxis, :, :, :] for m in fra])
-            X = X[np.newaxis, :, :, :, :]
-            np.save(db_name+str(k)+"_"+str(f)+"_"+classs+".npy", X, allow_pickle=True)
-        if k>100:
-            break
 
 def one_hot(batch_LABELS):
     nb_classes = len(_LABELS)
@@ -54,67 +15,118 @@ def one_hot(batch_LABELS):
     return one_hot_targets
 
 def random_crop(array):
-    num1 = np.random.randint(0, 256 - 224)
-    num2 = np.random.randint(0, 455 - 224)
-    crop = [ik[ :, :,  num1:num1+224, num2:num2+224, :] for ik in array]
-    return  np.concatenate(crop)
+    h = array.shape[2]
+    w = array.shape[3]
+    #print(h, w, array.shape)
+    hw = int((h - 224)/2)
+    wh = int((w - 224)/2)
+    #print(hw, wh)
+    num1 = np.random.randint(0,hw)
+    num2 = np.random.randint(0,wh)
+    #crop = [ik[ :, :,  num1:num1+224, num2:num2+224, :] for ik in array]
+    return  array[:, :, num1:num1+224, num2:num2+224, :]
 
-def npy_reader(f, mean_file):
-    labels = [i.rsplit("/")[-1].rsplit(".")[0].rsplit("_")[-1] for i in f]
-    f = [np.load(i) - mean_file for i in f]
-    f = random_crop(f)
-    return (f, labels)
+def center_crop(array):
+    h = array.shape[2]
+    w = array.shape[3]
+    hw = int((h-224)/2)
+    wh = int((w-224)/2)
+    return array[:, :, hw:hw+224, wh:wh+224, :]
 
-def npy_reader_valid(f, mean_file):
-    labels = f.rsplit("/")[-1].rsplit(".")[0].rsplit("_")[-1]
-    f = np.load(f) - mean_file
-    f = f[ :, :,  16:240, 115:339, :]
-    return (f, labels)
+def read_vid_rgb(images, resize_len, crop_h, crop_w):
+    """ read a list of images and concatenate them into numpy array
+    """
+    vid = []
+    for i in images:
+        img = cv2.imread(i)
 
-def test_vid(vid_loc, model_final, mean_file):
-    vid = read_vid(vid_loc)
-    vid = np.array(vid, dtype=np.float32)
-    print(vid.shape)
+        # convert color
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    output = []
-    for f in tqdm(gen_frame(vid.shape[0], 64, 32)):
-        X = np.concatenate([vid[i][np.newaxis, :, :, :] for i in f])
-        X = X[np.newaxis, :, :, :, :]
-        X -= mean_file
-        X = X[:, :, 16:240, 115:339, :]
-        m = model_final.predict(X)
-        output.append(m)
+        # resize
+        h, w = img.shape[:2]
+        resize_ratio = float(resize_len) / min(h, w)
+        img = cv2.resize(img, None, fx=resize_ratio, fy=resize_ratio)
 
-    output = np.concatenate(output)
-    output1 = np.argmax(output.mean(axis=0))
-    prob = np.max(output.mean(axis=0))
-    return _LABELS[output1], prob
-
-def mean_data(data_loc="data/train", sample=True, save_loc="data/mean_data__ucf.npy"):
-    files = glob.glob(data_loc+"/*.npy")
-    random.shuffle(files)
-    files = files[0: int(0.1*len(files))]
-    print("total_files: {}".format(len(files)))
-    x = 0
-    for k, i in enumerate(tqdm(files)):
-        y = np.squeeze(np.load(i))
-        y = np.float32(y)
-        x = x+y
-
-    final = x/k
-    print(final)
-    print(final.shape)
-
-    np.save(save_loc, final, allow_pickle=True)
+        # crop center
+        h, w = img.shape[:2]
+        center_y = int((h - crop_h)/2)
+        center_x = int((w - crop_w)/2)
+        #print(center_y, center_x, h, w, resize_ratio)
+        img = img[center_y:center_y+crop_h, center_x:center_x+crop_w, :]
+        vid.append(img[np.newaxis, :, :, :])
+    vid = np.concatenate(vid)
+    return vid
 
 
+def generate_numpy_files(vid_img_loc, resize_len, crop_h, crop_w, batch_size=79):
+    """Generates .npy files for each video at 79 frames per iteration iteratively.
+    """
+    images = glob.glob(vid_img_loc+"img_*.jpg")
+    images.sort()
+    flow_x = glob.glob(vid_img_loc+"flow_x_*.jpg")
+    flow_x.sort()
+    flow_y = glob.glob(vid_img_loc+"flow_y_*.jpg")
+    flow_y.sort()
 
-if __name__ == '__main__':
-    if not os.path.exists("data/train/"):
-        os.makedirs("data/train/")
+    print(len(images), len(flow_x), len(flow_y))
+    assert len(images) == len(flow_x)
+    assert len(flow_x) == len(flow_y)
 
-    create_npy_train_dataset("txt_files/train.lst", ".mp4", db_name="data/train/")
-    print(len(glob.glob("data/train/*.npy")))
+    total_batches = int(len(images)/batch_size)
 
-    print("[Calculating Mean of the data]")
-    mean_data()
+    for i in range(total_batches):
+        m = i*batch_size
+        n = (i+1)*batch_size
+        if n > len(images): break
+        images_rgb = images[m:n]
+        flow_x_batch = flow_x[m:n]
+        flow_y_batch = flow_y[m:n]
+
+        rgb = read_vid_rgb(images_rgb, resize_len, crop_h, crop_w)
+        rgb = np.expand_dims(rgb, axis=0)
+        rgb = np.float32(rgb)
+
+        for c in range(rgb.shape[4]):
+            tmp = np.float32(rgb[:,:,:,:,c])
+            rgb[:,:,:,:,c] = ((tmp - np.min(tmp)) / (np.max(tmp) - np.min(tmp)) - 0.5) * 2
+
+        print(rgb.shape)
+
+
+        flow = read_vid_flow(flow_x_batch, flow_y_batch, resize_len, crop_h, crop_w)
+        flow = np.expand_dims(flow, axis=0)
+        flow = np.float32(flow)
+
+        for c in range(flow.shape[4]):
+            tmp = np.float32(flow[:,:,:,:,c])
+            flow[:,:,:,:,c] = ((tmp - np.min(tmp)) / (np.max(tmp) - np.min(tmp)) - 0.5) * 2
+
+        print("start_frame: {}, end_frame: {}, rgb_shape: {}, flow_shape: {}".format(m, n, rgb.shape, flow.shape))
+        #assert rgb.shape == flow.shape
+        yield m, n, rgb, flow
+
+
+def read_vid_flow(flow_x, flow_y, resize_len, crop_h, crop_w):
+    """ read a list of flow images, combine x & y files and run it
+    """
+    vid = []
+    for i, j in zip(flow_x, flow_y):
+        imgx = cv2.imread(i, cv2.IMREAD_GRAYSCALE)
+        imgy = cv2.imread(j, cv2.IMREAD_GRAYSCALE)
+
+        h, w = imgx.shape[:2]
+        resize_ratio = float(resize_len) / min(h, w)
+        imgx = cv2.resize(imgx, None, fx=resize_ratio, fy=resize_ratio)
+        imgy = cv2.resize(imgy, None, fx=resize_ratio, fy=resize_ratio)
+
+        # crop center
+        h, w = imgx.shape[:2]
+        center_y = int((h - crop_h)/2)
+        center_x = int((w - crop_w)/2)
+        #print(center_y, cxenter_x, h, w, resize_ratio)
+        imgx = imgx[center_y:center_y+crop_h, center_x:center_x+crop_w][:, :, np.newaxis]
+        imgy = imgy[center_y:center_y+crop_h, center_x:center_x+crop_w][:, :, np.newaxis]
+        img = np.concatenate((imgx, imgy), axis=2)
+        vid.append(img[np.newaxis, :, :, :])
+    return np.concatenate(vid)
